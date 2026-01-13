@@ -3,9 +3,12 @@ export interface ScanRequest {
   credentials?: {
     username: string;
     password: string;
+    loginUrl?: string; // Optional: URL of the login page for form-based auth
   };
   timestamp: Date;
   maxPages?: number; // Maximum number of pages to scan
+  abortSignal?: AbortSignal; // Optional: Signal to abort the scan
+  scanType?: 'public' | 'authenticated' | 'both'; // Type of pages to scan (default: 'both')
 }
 
 export interface Violation {

@@ -1,9 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 interface UrlFormProps {
-  onSubmit: (url: string, credentials?: { username: string; password: string }) => void;
+  onSubmit: (url: string, scanType: 'public' | 'authenticated' | 'both', credentials?: { username: string; password: string; loginUrl?: string }) => void;
   disabled?: boolean;
 }
 
@@ -12,6 +12,23 @@ export default function UrlForm({ onSubmit, disabled = false }: UrlFormProps) {
   const [showAuth, setShowAuth] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [loginUrl, setLoginUrl] = useState('');
+  const [scanType, setScanType] = useState<'public' | 'authenticated' | 'both'>('both');
+
+  // Listen for reset event from parent
+  useEffect(() => {
+    const handleReset = () => {
+      setUrl('');
+      setShowAuth(false);
+      setUsername('');
+      setPassword('');
+      setLoginUrl('');
+      setScanType('both');
+    };
+
+    window.addEventListener('resetScanForm', handleReset);
+    return () => window.removeEventListener('resetScanForm', handleReset);
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -19,13 +36,37 @@ export default function UrlForm({ onSubmit, disabled = false }: UrlFormProps) {
     if (!url.trim()) return;
 
     const credentials =
-      showAuth && username && password ? { username, password } : undefined;
+      showAuth && username && password 
+        ? { username, password, loginUrl: loginUrl.trim() || undefined } 
+        : undefined;
 
-    onSubmit(url.trim(), credentials);
+    onSubmit(url.trim(), scanType, credentials);
   };
 
   return (
     <form onSubmit={handleSubmit} className="bg-white rounded-lg shadow-lg p-6">
+      <div className="mb-4">
+        <label htmlFor="scanType" className="block text-sm font-medium text-gray-700 mb-2">
+          Scan Type
+        </label>
+        <select
+          id="scanType"
+          value={scanType}
+          onChange={e => setScanType(e.target.value as 'public' | 'authenticated' | 'both')}
+          disabled={disabled}
+          className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
+        >
+          <option value="both">All Pages (Public + Authenticated)</option>
+          <option value="public">Public Pages Only</option>
+          <option value="authenticated">Authenticated Pages Only</option>
+        </select>
+        <p className="text-xs text-gray-500 mt-1">
+          {scanType === 'authenticated' && 'Only scans pages behind login. Credentials required.'}
+          {scanType === 'public' && 'Scans only publicly accessible pages without authentication.'}
+          {scanType === 'both' && 'Scans all discoverable pages, authenticated and public.'}
+        </p>
+      </div>
+
       <div className="mb-4">
         <label htmlFor="url" className="block text-sm font-medium text-gray-700 mb-2">
           URL to Scan
@@ -90,6 +131,25 @@ export default function UrlForm({ onSubmit, disabled = false }: UrlFormProps) {
               aria-label="Password for authentication"
               autoComplete="current-password"
             />
+          </div>
+          <div>
+            <label htmlFor="loginUrl" className="block text-sm font-medium text-gray-700 mb-2">
+              Login Page URL (Optional)
+            </label>
+            <input
+              type="url"
+              id="loginUrl"
+              name="loginUrl"
+              value={loginUrl}
+              onChange={e => setLoginUrl(e.target.value)}
+              placeholder="https://example.com/login"
+              disabled={disabled}
+              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
+              aria-label="Login page URL for form-based authentication"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Leave empty for HTTP Basic Auth. Provide login page URL for form-based login.
+            </p>
           </div>
           <p className="text-sm text-gray-600">
             <strong>Note:</strong> Credentials are only used for this scan and are not stored.

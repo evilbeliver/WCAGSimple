@@ -18,10 +18,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Convert timestamp string to Date
+    // Convert timestamp string to Date and attach abort signal
     const scanRequest: ScanRequest = {
       ...body,
       timestamp: new Date(body.timestamp),
+      abortSignal: request.signal, // Pass the request's abort signal
     };
 
     // Perform scan

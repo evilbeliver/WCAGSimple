@@ -17,16 +17,44 @@ export default function HomePage() {
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scannedUrls, setScannedUrls] = useState<ScannedUrl[]>([]);
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
 
-  const handleScan = async (url: string, credentials?: { username: string; password: string }) => {
+  const handleCancel = () => {
+    if (abortController) {
+      abortController.abort();
+      setAbortController(null);
+      setScanning(false);
+      setError('Scan cancelled by user');
+    }
+  };
+
+  const handleNewScan = () => {
+    setScanResult(null);
+    setError(null);
+    setScanning(false);
+    setAbortController(null);
+    // Trigger reset in UrlForm component
+    window.dispatchEvent(new CustomEvent('resetScanForm'));
+  };
+
+  const handleScan = async (url: string, scanType: 'public' | 'authenticated' | 'both', credentials?: { username: string; password: string; loginUrl?: string }) => {
     setScanning(true);
     setError(null);
     setScanResult(null);
+
+    // Create new abort controller
+    const controller = new AbortController();
+    setAbortController(controller);
 
     try {
       // Validate URL
       if (!url.startsWith('http://') && !url.startsWith('https://')) {
         throw new Error('URL must start with http:// or https://');
+      }
+
+      // Validate scanType and credentials
+      if (scanType === 'authenticated' && !credentials) {
+        throw new Error('Credentials are required for authenticated page scanning');
       }
 
       const response = await fetch('/api/scan', {
@@ -37,8 +65,10 @@ export default function HomePage() {
         body: JSON.stringify({
           url,
           credentials,
+          scanType,
           timestamp: new Date().toISOString(),
         }),
+        signal: controller.signal,
       });
 
       const data = await response.json();
@@ -55,11 +85,17 @@ export default function HomePage() {
         ...prev.slice(0, 9) // Keep last 10 scans
       ]);
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred';
-      console.error('Scan error:', err);
-      setError(errorMessage);
+      // Don't show error if it was cancelled
+      if (err instanceof Error && err.name === 'AbortError') {
+        setError('Scan cancelled');
+      } else {
+        const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred';
+        console.error('Scan error:', err);
+        setError(errorMessage);
+      }
     } finally {
       setScanning(false);
+      setAbortController(null);
     }
   };
 
@@ -111,7 +147,29 @@ export default function HomePage() {
 
         <UrlForm onSubmit={handleScan} disabled={scanning} />
 
+        {scanning && (
+          <div className="mt-4 flex justify-center">
+            <button
+              onClick={handleCancel}
+              className="px-6 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 transition-colors"
+            >
+              Cancel Scan
+            </button>
+          </div>
+        )}
+
         {scanning && <ScanningStatus />}
+
+        {scanResult && !scanning && (
+          <div className="mt-4 flex justify-center">
+            <button
+              onClick={handleNewScan}
+              className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
+            >
+              New Scan
+            </button>
+          </div>
+        )}
 
         {scanResult && !scanning && (
           <div className="mt-8">

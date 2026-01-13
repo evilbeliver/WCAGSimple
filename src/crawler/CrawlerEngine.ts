@@ -1,4 +1,4 @@
-import { chromium, Browser, Page } from 'playwright';
+import { chromium, Browser, Page, BrowserContext } from 'playwright';
 import type { ScanRequest, ScanResult, Violation, PageScanResult } from '../utils/types';
 import { ScanError, isValidUrl, sanitizeCredentials } from '../utils/errors';
 import { logger } from '../utils/logger';
@@ -7,17 +7,32 @@ import { generateHtmlReport } from '../reporter/HtmlReporter';
 
 export class CrawlerEngine {
   private browser: Browser | null = null;
+  private browserContext: BrowserContext | null = null; // Shared context for cookie persistence
   private visitedUrls: Set<string> = new Set();
-  private maxPages: number = 50; // Default max pages to scan
+  private maxPages: number = 100; // Default max pages to scan
+  private authenticated: boolean = false; // Track if already authenticated
+  private authPage: Page | null = null; // Keep the authenticated page open to maintain session
 
   async initialize(): Promise<void> {
     if (!this.browser) {
-      this.browser = await chromium.launch({ headless: true });
-      logger.info('Browser initialized');
+      this.browser = await chromium.launch({ 
+        headless: true,
+      });
+      // Create a persistent browser context for all pages to share cookies
+      this.browserContext = await this.browser.newContext();
+      logger.info('Browser initialized with persistent context');
     }
   }
 
   async close(): Promise<void> {
+    if (this.authPage) {
+      await this.authPage.close().catch(() => {});
+      this.authPage = null;
+    }
+    if (this.browserContext) {
+      await this.browserContext.close().catch(() => {});
+      this.browserContext = null;
+    }
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
@@ -28,13 +43,24 @@ export class CrawlerEngine {
   async scan(request: ScanRequest): Promise<ScanResult> {
     const startTime = Date.now();
     this.visitedUrls.clear();
-    this.maxPages = request.maxPages || 50;
+    this.maxPages = request.maxPages || 100;
+    const scanType = request.scanType || 'both';
     
-    logger.info('Starting multi-page scan', { url: request.url, maxPages: this.maxPages });
+    logger.info('Starting multi-page scan', { url: request.url, maxPages: this.maxPages, scanType });
 
     // Validate URL
     if (!isValidUrl(request.url)) {
       throw new ScanError('Invalid URL format', 'INVALID_URL', request.url);
+    }
+
+    // Check if already aborted
+    if (request.abortSignal?.aborted) {
+      throw new ScanError('Scan cancelled', 'SCAN_CANCELLED', 'Scan was cancelled before starting');
+    }
+
+    // Validate authenticated scan requires credentials
+    if (scanType === 'authenticated' && !request.credentials) {
+      throw new ScanError('Credentials required', 'CREDENTIALS_REQUIRED', 'Authenticated scan requires login credentials');
     }
 
     // Sanitize credentials
@@ -48,16 +74,31 @@ export class CrawlerEngine {
     const urlsToScan: string[] = [request.url];
 
     try {
-      // Try to discover URLs from sitemap first
-      const sitemapUrls = await this.discoverSitemapUrls(baseUrl);
-      if (sitemapUrls.length > 0) {
-        logger.info('Discovered URLs from sitemap', { count: sitemapUrls.length, baseUrl });
-        // Add sitemap URLs to the queue (but don't exceed maxPages)
-        urlsToScan.push(...sitemapUrls.slice(0, this.maxPages - 1));
+      // Perform authentication once before scanning (if credentials provided and not public-only scan)
+      if (request.credentials && scanType !== 'public') {
+        await this.handleAuthentication(request);
+      }
+
+      // Try to discover URLs from sitemap first (skip for authenticated-only scans)
+      if (scanType !== 'authenticated') {
+        const sitemapUrls = await this.discoverSitemapUrls(baseUrl);
+        if (sitemapUrls.length > 0) {
+          logger.info('Discovered URLs from sitemap', { count: sitemapUrls.length, baseUrl });
+          // Add sitemap URLs to the queue (but don't exceed maxPages)
+          urlsToScan.push(...sitemapUrls.slice(0, this.maxPages - 1));
+        }
+      } else {
+        logger.info('Skipping sitemap discovery for authenticated-only scan');
       }
 
       // Crawl pages up to maxPages limit
       while (urlsToScan.length > 0 && pages.length < this.maxPages) {
+        // Check if scan was cancelled
+        if (request.abortSignal?.aborted) {
+          logger.info('Scan cancelled by user', { pagesScanned: pages.length });
+          throw new ScanError('Scan cancelled', 'SCAN_CANCELLED', 'Scan was cancelled by user');
+        }
+        
         const currentUrl = urlsToScan.shift()!;
         
         // Skip if already visited
@@ -68,14 +109,19 @@ export class CrawlerEngine {
         this.visitedUrls.add(currentUrl);
         logger.info('Scanning page', { url: currentUrl, progress: `${pages.length + 1}/${this.maxPages}` });
 
-        const page = await this.browser!.newPage();
+        const page = await this.browserContext!.newPage();
+        
+        // Debug: Check if cookies are available in this new page's context
+        if (this.authenticated) {
+          const pageCookies = await page.context().cookies();
+          logger.info('Cookies available in new page', { 
+            url: currentUrl,
+            cookieCount: pageCookies.length,
+            hasCookies: pageCookies.length > 0
+          });
+        }
         
         try {
-          // Handle authentication if credentials provided
-          if (request.credentials) {
-            await this.handleAuthentication(page, request);
-          }
-
           // Navigate to URL with timeout
           const response = await page.goto(currentUrl, {
             waitUntil: 'load',
@@ -87,7 +133,50 @@ export class CrawlerEngine {
             continue;
           }
 
-          logger.info('Page loaded', { url: currentUrl, status: response.status() });
+          // Check if page is behind authentication
+          const finalUrl = page.url();
+          const isLoginPage = finalUrl.includes('/login') || finalUrl.includes('/signin') || finalUrl.includes('/auth');
+          const isAuthenticatedPath = (
+            finalUrl.includes('/dashboard') || 
+            finalUrl.includes('/account') || 
+            finalUrl.includes('/profile') || 
+            finalUrl.includes('/settings') ||
+            finalUrl.includes('/my') ||
+            finalUrl.includes('/user') ||
+            finalUrl.includes('/member')
+          );
+          const isPublicPath = (
+            finalUrl === baseUrl + '/' ||
+            finalUrl === baseUrl ||
+            finalUrl.includes('/about') ||
+            finalUrl.includes('/contact') ||
+            finalUrl.includes('/faq') ||
+            finalUrl.includes('/help') ||
+            finalUrl.includes('/terms') ||
+            finalUrl.includes('/privacy') ||
+            finalUrl.includes('/how-it-works') ||
+            finalUrl.includes('/health-plans')
+          );
+          
+          // Filter based on scanType
+          if (scanType === 'authenticated') {
+            // In authenticated mode, skip login pages and public pages
+            if (isLoginPage) {
+              logger.warn('Redirected to login page, skipping', { url: currentUrl, redirectedTo: finalUrl });
+              continue;
+            }
+            if (isPublicPath && !isAuthenticatedPath) {
+              logger.info('Skipping public page in authenticated-only scan', { url: currentUrl });
+              continue;
+            }
+          }
+          
+          if (scanType === 'public' && isLoginPage) {
+            logger.info('Skipping login page in public scan', { url: currentUrl });
+            continue;
+          }
+
+          logger.info('Page loaded', { url: currentUrl, status: response.status(), finalUrl });
 
           // Wait for JavaScript-rendered content (wait a bit for dynamic content to load)
           await page.waitForTimeout(2000);
@@ -159,6 +248,12 @@ export class CrawlerEngine {
         'SCAN_FAILED',
         error instanceof Error ? error.message : String(error)
       );
+    } finally {
+      this.authenticated = false; // Reset for next scan
+      if (this.authPage) {
+        await this.authPage.close().catch(() => {});
+        this.authPage = null;
+      }
     }
   }
 
@@ -346,21 +441,184 @@ export class CrawlerEngine {
     }
   }
 
-  private async handleAuthentication(page: Page, request: ScanRequest): Promise<void> {
-    if (!request.credentials) return;
+  private async handleAuthentication(request: ScanRequest): Promise<void> {
+    if (!request.credentials || this.authenticated) return;
 
-    logger.info('Attempting authentication', { url: request.url });
+    const { username, password, loginUrl } = request.credentials;
+    logger.info('Attempting authentication', { url: request.url, method: loginUrl ? 'form-based' : 'basic' });
 
     try {
-      // Basic HTTP authentication
-      await page.setExtraHTTPHeaders({
-        Authorization: `Basic ${Buffer.from(
-          `${request.credentials.username}:${request.credentials.password}`
-        ).toString('base64')}`,
-      });
-
-      logger.info('Authentication configured');
+      if (loginUrl) {
+        // Form-based authentication - do it once and cookies will persist
+        const page = await this.browserContext!.newPage();
+        
+        try {
+          logger.info('Navigating to login page', { loginUrl });
+          await page.goto(loginUrl, { waitUntil: 'networkidle', timeout: 60000 });
+          
+          // Wait for page to be fully loaded
+          await page.waitForTimeout(1000);
+        
+          // Try to find and fill common username/email field selectors
+        const usernameSelectors = [
+          'input[name="username"]',
+          'input[name="email"]',
+          'input[type="email"]',
+          'input[name="user"]',
+          'input[id="username"]',
+          'input[id="email"]',
+          'input[placeholder*="username" i]',
+          'input[placeholder*="email" i]',
+          'input[autocomplete="username"]',
+          'input[autocomplete="email"]',
+        ];
+        
+        let usernameField = null;
+        for (const selector of usernameSelectors) {
+          usernameField = await page.$(selector);
+          if (usernameField) {
+            logger.info('Found username field', { selector });
+            break;
+          }
+        }
+        
+        if (!usernameField) {
+          throw new Error('Could not find username/email input field');
+        }
+        
+        // Try to find and fill common password field selectors
+        const passwordSelectors = [
+          'input[name="password"]',
+          'input[type="password"]',
+          'input[id="password"]',
+          'input[autocomplete="current-password"]',
+        ];
+        
+        let passwordField = null;
+        for (const selector of passwordSelectors) {
+          passwordField = await page.$(selector);
+          if (passwordField) {
+            logger.info('Found password field', { selector });
+            break;
+          }
+        }
+        
+        if (!passwordField) {
+          throw new Error('Could not find password input field');
+        }
+        
+        // Fill in the credentials
+        await usernameField.fill(username);
+        await passwordField.fill(password);
+        
+        logger.info('Credentials filled, submitting form');
+        
+        // Try to find and click the submit button
+        const submitSelectors = [
+          'button[type="submit"]',
+          'input[type="submit"]',
+          'button[name="submit"]',
+          'button:has-text("Sign in")',
+          'button:has-text("Log in")',
+          'button:has-text("Login")',
+          'button:has-text("Submit")',
+        ];
+        
+        let submitButton = null;
+        for (const selector of submitSelectors) {
+          try {
+            submitButton = await page.$(selector);
+            if (submitButton) {
+              logger.info('Found submit button', { selector });
+              break;
+            }
+          } catch {
+            // Continue to next selector
+          }
+        }
+        
+        if (submitButton) {
+          // Click submit and wait for navigation (or timeout)
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'load', timeout: 30000 }).catch((err) => {
+              // Navigation might not happen if it's a SPA, log but continue
+              logger.warn('Navigation timeout after login', { error: String(err) });
+            }),
+            submitButton.click(),
+          ]);
+          
+          // Wait additional time for session to be established
+          await page.waitForTimeout(3000);
+        } else {
+          // Try pressing Enter as fallback
+          logger.warn('Could not find submit button, pressing Enter');
+          await passwordField.press('Enter');
+          await page.waitForTimeout(5000); // Wait longer for login to process
+        }
+        
+        // Verify login succeeded by checking URL and page content
+        const postLoginUrl = page.url();
+        logger.info('Post-login check', { postLoginUrl });
+        
+        // Check if we navigated away from login page (even if just to a redirect page)
+        const stillOnLoginPage = postLoginUrl.includes('/login') || postLoginUrl.includes('/signin');
+        
+        // Also check if there are any error messages on the page
+        const hasLoginError = await page.evaluate(() => {
+          const errorSelectors = [
+            '.error', '.alert-error', '.alert-danger', 
+            '[class*="error"]', '[class*="invalid"]',
+            '[role="alert"]'
+          ];
+          return errorSelectors.some(sel => {
+            const el = document.querySelector(sel);
+            return el && el.textContent && el.textContent.length > 0;
+          });
+        });
+        
+        if (stillOnLoginPage || hasLoginError) {
+          logger.error('Login failed', { stillOnLoginPage, hasLoginError, postLoginUrl });
+          throw new Error('Authentication failed - check credentials or login page changed');
+        }
+        
+        // Get cookies to verify session was created
+        const context = page.context();
+        const cookies = await context.cookies();
+        const sessionCookies = cookies.filter(c => 
+          c.name.toLowerCase().includes('session') || 
+          c.name.toLowerCase().includes('auth') ||
+          c.name.toLowerCase().includes('token')
+        );
+        logger.info('Authentication cookies set', { 
+          totalCookies: cookies.length,
+          sessionCookies: sessionCookies.map(c => c.name)
+        });
+        
+        if (cookies.length === 0) {
+          logger.warn('No cookies set after login - authentication may not persist');
+        }
+        
+        logger.info('Form-based authentication completed successfully');
+        
+        // Store the authenticated page to keep session alive
+        this.authPage = page;
+        
+        } finally {
+          // Don't close the page in finally - we stored it in this.authPage
+        }
+        
+        this.authenticated = true; // Mark as authenticated
+      } else {
+        // HTTP Basic authentication - set on browser context
+        const context = this.browser!.contexts()[0];
+        await context.setExtraHTTPHeaders({
+          Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`,
+        });
+        logger.info('HTTP Basic authentication configured');
+        this.authenticated = true;
+      }
     } catch (error) {
+      logger.error('Authentication failed', { error: String(error) });
       throw new ScanError(
         'Authentication failed',
         'AUTH_FAILED',
