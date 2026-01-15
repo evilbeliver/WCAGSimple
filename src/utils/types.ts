@@ -48,6 +48,7 @@ export interface ScanResult {
     minor: number;
   };
   reportHtml: string;
+  reportJson: string; // Axe-core JSON format report
   completedAt: Date;
   success: boolean;
   error?: string;

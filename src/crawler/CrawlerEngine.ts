@@ -4,6 +4,7 @@ import { ScanError, isValidUrl, sanitizeCredentials } from '../utils/errors';
 import { logger } from '../utils/logger';
 import { runAxeChecks } from '../checks/AxeRunner';
 import { generateHtmlReport } from '../reporter/HtmlReporter';
+import { generateAxeCoreJsonReport } from '../reporter/JsonReporter';
 
 export class CrawlerEngine {
   private browser: Browser | null = null;
@@ -216,6 +217,9 @@ export class CrawlerEngine {
 
       // Generate HTML report with all pages
       const reportHtml = generateHtmlReport(request.url, pages, totalSummary);
+      
+      // Generate JSON report in axe-core format
+      const reportJson = generateAxeCoreJsonReport(request.url, pages, totalSummary);
 
       const result: ScanResult = {
         url: request.url,
@@ -223,6 +227,7 @@ export class CrawlerEngine {
         violations: allViolations,
         summary: totalSummary,
         reportHtml,
+        reportJson,
         completedAt: new Date(),
         success: true,
       };
